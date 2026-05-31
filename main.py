@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 import httpx
 import os
 
@@ -103,3 +103,6 @@ async def chat(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "Design Planner AI Agent — Alina"}
+    @app.get("/agent.html")
+async def agent_page():
+    return FileResponse("agent.html")
