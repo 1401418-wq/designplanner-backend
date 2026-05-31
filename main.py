@@ -73,36 +73,56 @@ SYSTEM = """Ты — Алина, умный помощник студии диз
 
 @app.post("/chat")
 async def chat(request: Request):
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse(
+            {"error": "ANTHROPIC_API_KEY is not configured on the server"},
+            status_code=500,
+        )
+
     body = await request.json()
     messages = body.get("messages", [])
+    if not messages:
+        return JSONResponse({"error": "messages is empty"}, status_code=400)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1000,
-                "system": SYSTEM,
-                "messages": messages,
-            },
-        )
-        data = response.json()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 2000,
+                    "system": SYSTEM,
+                    "messages": messages,
+                },
+            )
+            data = response.json()
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
 
     if "error" in data:
-        return JSONResponse({"error": data["error"]}, status_code=500)
+        return JSONResponse({"error": data["error"]}, status_code=response.status_code or 500)
 
-    reply = data["content"][0]["text"]
+    content = data.get("content") or []
+    text_parts = [block.get("text", "") for block in content if block.get("type") == "text"]
+    reply = "".join(text_parts).strip()
+    if not reply:
+        return JSONResponse(
+            {"error": "empty reply from model", "raw": data},
+            status_code=502,
+        )
     return JSONResponse({"reply": reply})
 
 
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "Design Planner AI Agent — Alina"}
-    @app.get("/agent.html")
+
+
+@app.get("/agent.html")
 async def agent_page():
     return FileResponse("agent.html")
