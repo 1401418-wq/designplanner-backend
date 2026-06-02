@@ -2,7 +2,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import httpx
+import json
 import os
+import re
 
 app = FastAPI()
 
@@ -14,6 +16,8 @@ app.add_middleware(
 )
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+BROADCAST_URL = os.environ.get("BROADCAST_URL", "")
+BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
 
 SYSTEM = """Ты — Алина, умный помощник студии дизайна интерьера Design Planner (дизайнер Екатерина, Москва).
 Отвечай вежливо, по делу, в спокойном профессиональном тоне. Без лишних эмодзи.
@@ -132,3 +136,171 @@ async def root():
 @app.get("/agent.html")
 async def agent_page():
     return FileResponse("agent.html")
+
+
+# ─────────────────── Concept brief → moodboard ───────────────────
+
+BRIEF_SYSTEM = """Ты — арт-директор студии интерьерного дизайна Design Planner (Москва, дизайнер Екатерина).
+Студия: тёплый минимализм, Japandi, скандинавский, функциональное проектирование жилых пространств.
+
+Тебе приходит бриф клиента. Твоя задача — выдать ТРИ заметно разных концепт-направления для обсуждения с клиентом.
+
+Отвечай СТРОГО валидным JSON-массивом без markdown-обёртки и без комментариев. Никакого текста до или после JSON.
+
+Структура каждого направления:
+{
+  "name": "Название концепции (2-4 слова, на русском)",
+  "tagline": "Одна строка — суть атмосферы (10-15 слов)",
+  "palette": [
+    {"hex": "#XXXXXX", "name": "название цвета"},
+    ... ровно 5 цветов от светлого фона к акцентам
+  ],
+  "materials": [
+    "Дуб натуральный, светлая морилка",
+    ... 5-6 материалов с конкретикой по фактуре/цвету/обработке
+  ],
+  "furniture": [
+    "Низкий диван-татами, обивка букле",
+    ... 5-6 предметов с описанием формы/материала
+  ],
+  "lighting": "Описание света в 1-2 предложения — температура, источники, акценты",
+  "mood": "Атмосфера в 2-3 предложениях — что чувствует человек, время дня, звуки",
+  "image_prompts": [
+    "конкретный prompt для AI-генерации картинки этой комнаты, на английском, 15-25 слов, кинематографичный",
+    ... 4 prompt'а: общий вид, угол с диваном/кроватью, деталь материала, акцентная стена
+  ]
+}
+
+Правила:
+- 3 концепции должны заметно отличаться: разные настроения, не вариации одного
+- Учитывай площадь, стороны света, образ жизни клиента, "что НЕ нравится"
+- Бюджет: эконом → не предлагай редкий мрамор / комфорт+ → можно
+- Если клиент назвал стиль-ориентир — одна из 3 концепций должна быть в нём, две другие — альтернативы
+- Палитра должна работать в реальном интерьере: светлый фон + 2 нейтральных + 2 акцента
+"""
+
+
+def _parse_concepts(text: str):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def _format_brief_for_claude(b: dict) -> str:
+    """Превращает поля формы в человеческий текст брифа."""
+    parts = []
+    room = b.get("room", "").strip()
+    area = b.get("area", "").strip()
+    if room or area:
+        parts.append(f"Помещение: {room}" + (f", {area} м²" if area else ""))
+    if b.get("ceiling"):
+        parts.append(f"Высота потолков: {b['ceiling']} м")
+    if b.get("people"):
+        parts.append(f"Кто живёт: {b['people']}")
+    if b.get("lifestyle"):
+        parts.append(f"Образ жизни / как используется: {b['lifestyle']}")
+    if b.get("budget"):
+        parts.append(f"Бюджет: {b['budget']}")
+    if b.get("light"):
+        parts.append(f"Свет / окна: {b['light']}")
+    if b.get("dislikes"):
+        parts.append(f"Что НЕ нравится: {b['dislikes']}")
+    if b.get("style"):
+        parts.append(f"Стиль-ориентир: {b['style']}")
+    if b.get("anchors"):
+        parts.append(f"Якоря / обязательное: {b['anchors']}")
+    if b.get("notes"):
+        parts.append(f"Доп. пожелания: {b['notes']}")
+    return "\n".join(parts) if parts else "Бриф пустой — предложи 3 универсальных направления для жилого пространства."
+
+
+async def broadcast_lead(payload: dict) -> None:
+    """Уведомление в семейный TG-хаб. Fire-and-forget."""
+    if not (BROADCAST_URL and BROADCAST_SECRET):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                BROADCAST_URL,
+                json=payload,
+                headers={"X-Broadcast-Secret": BROADCAST_SECRET},
+            )
+    except Exception as e:
+        print(f"[broadcast] failed: {e}")
+
+
+@app.post("/brief")
+async def brief_endpoint(request: Request):
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY is not configured"}, status_code=500)
+
+    body = await request.json()
+    if not body.get("room") and not body.get("area"):
+        return JSONResponse(
+            {"error": "Минимум укажите помещение или площадь"},
+            status_code=400,
+        )
+
+    brief_text = _format_brief_for_claude(body)
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 4000,
+                    "system": [
+                        {
+                            "type": "text",
+                            "text": BRIEF_SYSTEM,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"Бриф клиента:\n\n{brief_text}\n\nДай 3 концепт-направления.",
+                        }
+                    ],
+                },
+            )
+            data = response.json()
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
+
+    if "error" in data:
+        return JSONResponse({"error": data["error"]}, status_code=response.status_code or 500)
+
+    text = "".join(b.get("text", "") for b in (data.get("content") or []) if b.get("type") == "text").strip()
+    if not text:
+        return JSONResponse({"error": "empty reply from model", "raw": data}, status_code=502)
+
+    try:
+        concepts = _parse_concepts(text)
+    except Exception as e:
+        return JSONResponse({"error": f"could not parse concepts: {e}", "raw": text[:500]}, status_code=502)
+
+    # уведомление в TG (не блокирует ответ клиенту)
+    contact = (body.get("contact") or "").strip()
+    name = (body.get("name") or "").strip()
+    summary = f"{body.get('room','?')} / {body.get('area','?')} м² · бюджет: {body.get('budget','?')}"
+    if body.get("style"):
+        summary += f" · стиль: {body['style']}"
+    await broadcast_lead({
+        "source": "design-planner.com/brief",
+        "name": name or "—",
+        "contact": contact or "не оставил",
+        "niche": "дизайн интерьера",
+        "tariff": body.get("budget", ""),
+        "summary": f"📋 Новый бриф на мудборд\n\n{brief_text}\n\nКонцепции: " + " · ".join(c.get("name", "?") for c in concepts),
+    })
+
+    return JSONResponse({"concepts": concepts, "usage": data.get("usage")})
