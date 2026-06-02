@@ -18,6 +18,7 @@ app.add_middleware(
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BROADCAST_URL = os.environ.get("BROADCAST_URL", "")
 BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
 SYSTEM = """Ты — Алина, умный помощник студии дизайна интерьера Design Planner (дизайнер Екатерина, Москва).
 Отвечай вежливо, по делу, в спокойном профессиональном тоне. Без лишних эмодзи.
@@ -168,6 +169,10 @@ BRIEF_SYSTEM = """Ты — арт-директор студии интерьер
   "image_prompts": [
     "конкретный prompt для AI-генерации картинки этой комнаты, на английском, 15-25 слов, кинематографичный",
     ... 4 prompt'а: общий вид, угол с диваном/кроватью, деталь материала, акцентная стена
+  ],
+  "pexels_queries": [
+    "короткий запрос на английском для поиска фото в Pexels (2-4 слова, без 'a/the'), описывает СТИЛЬ комнаты — не уникальную сцену",
+    ... ровно 4 запроса, по одному на каждый image_prompt. Примеры: 'japandi living room', 'beige minimalist interior', 'warm wood texture', 'linen sofa detail'
   ]
 }
 
@@ -214,6 +219,67 @@ def _format_brief_for_claude(b: dict) -> str:
     if b.get("notes"):
         parts.append(f"Доп. пожелания: {b['notes']}")
     return "\n".join(parts) if parts else "Бриф пустой — предложи 3 универсальных направления для жилого пространства."
+
+
+async def fetch_pexels(client: httpx.AsyncClient, query: str) -> dict | None:
+    """Один поиск в Pexels. Возвращает {url, photographer, page} или None."""
+    if not PEXELS_API_KEY or not query:
+        return None
+    try:
+        r = await client.get(
+            "https://api.pexels.com/v1/search",
+            params={"query": query, "per_page": 5, "orientation": "square"},
+            headers={"Authorization": PEXELS_API_KEY},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return None
+        photos = (r.json() or {}).get("photos") or []
+        if not photos:
+            return None
+        p = photos[0]
+        return {
+            "url": (p.get("src") or {}).get("large") or (p.get("src") or {}).get("medium"),
+            "photographer": p.get("photographer"),
+            "page": p.get("url"),
+        }
+    except Exception as e:
+        print(f"[pexels] '{query}' failed: {e}")
+        return None
+
+
+async def attach_pexels_images(concepts: list) -> None:
+    """Для каждой концепции тянет 4 картинки из Pexels параллельно. Мутирует concepts."""
+    if not PEXELS_API_KEY:
+        return
+    import asyncio
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        slots: list[tuple[int, int]] = []
+        for ci, c in enumerate(concepts):
+            queries = c.get("pexels_queries") or []
+            for qi, q in enumerate(queries[:4]):
+                slots.append((ci, qi))
+                tasks.append(fetch_pexels(client, q))
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    by_concept: dict[int, list] = {}
+    for (ci, qi), res in zip(slots, results):
+        by_concept.setdefault(ci, [None] * 4)[qi] = res
+
+    for ci, c in enumerate(concepts):
+        prompts = c.get("image_prompts") or []
+        photos = by_concept.get(ci, [None] * 4)
+        c["images"] = [
+            {
+                "prompt": prompts[i] if i < len(prompts) else "",
+                "query": (c.get("pexels_queries") or [None] * 4)[i],
+                "url": (photos[i] or {}).get("url") if photos[i] else None,
+                "photographer": (photos[i] or {}).get("photographer") if photos[i] else None,
+                "page": (photos[i] or {}).get("page") if photos[i] else None,
+            }
+            for i in range(4)
+        ]
 
 
 async def broadcast_lead(payload: dict) -> None:
@@ -287,6 +353,9 @@ async def brief_endpoint(request: Request):
         concepts = _parse_concepts(text)
     except Exception as e:
         return JSONResponse({"error": f"could not parse concepts: {e}", "raw": text[:500]}, status_code=502)
+
+    # подтянуть реальные фото из Pexels (если ключ выставлен)
+    await attach_pexels_images(concepts)
 
     # уведомление в TG (не блокирует ответ клиенту)
     contact = (body.get("contact") or "").strip()
