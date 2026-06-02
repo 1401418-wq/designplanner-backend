@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, FileResponse
 import httpx
 import json
 import os
+import random
 import re
 
 app = FastAPI()
@@ -232,23 +233,40 @@ def _format_brief_for_claude(b: dict) -> str:
     return "\n".join(parts) if parts else "Бриф пустой — предложи 3 универсальных направления для жилого пространства."
 
 
-async def fetch_pexels(client: httpx.AsyncClient, query: str, pexels_page: int = 1) -> dict | None:
-    """Один поиск в Pexels. pexels_page — страница пагинации (1 = первая)."""
+async def _pexels_search(client: httpx.AsyncClient, query: str, page: int, per_page: int) -> list:
+    r = await client.get(
+        "https://api.pexels.com/v1/search",
+        params={"query": query, "per_page": per_page, "page": max(1, page), "orientation": "square"},
+        headers={"Authorization": PEXELS_API_KEY},
+        timeout=12,
+    )
+    if r.status_code != 200:
+        return []
+    return (r.json() or {}).get("photos") or []
+
+
+async def fetch_pexels(client: httpx.AsyncClient, query: str, randomize: bool = False) -> dict | None:
+    """Один поиск в Pexels.
+    randomize=False: первое фото первой страницы (детерминированный отбор для первой генерации).
+    randomize=True: случайная страница 1..3, случайное фото из per_page=15. Фоллбэк на page=1 если пусто.
+    """
     if not PEXELS_API_KEY or not query:
         return None
     try:
-        r = await client.get(
-            "https://api.pexels.com/v1/search",
-            params={"query": query, "per_page": 5, "page": max(1, pexels_page), "orientation": "square"},
-            headers={"Authorization": PEXELS_API_KEY},
-            timeout=12,
-        )
-        if r.status_code != 200:
-            return None
-        photos = (r.json() or {}).get("photos") or []
-        if not photos:
-            return None
-        p = photos[0]
+        if randomize:
+            per_page = 15
+            page = random.randint(1, 3)
+            photos = await _pexels_search(client, query, page, per_page)
+            if not photos and page != 1:
+                photos = await _pexels_search(client, query, 1, per_page)
+            if not photos:
+                return None
+            p = random.choice(photos)
+        else:
+            photos = await _pexels_search(client, query, 1, 5)
+            if not photos:
+                return None
+            p = photos[0]
         return {
             "url": (p.get("src") or {}).get("large") or (p.get("src") or {}).get("medium"),
             "photographer": p.get("photographer"),
@@ -259,15 +277,15 @@ async def fetch_pexels(client: httpx.AsyncClient, query: str, pexels_page: int =
         return None
 
 
-async def fetch_pexels_set(queries: list, prompts: list, pexels_page: int = 1) -> list:
-    """Тянет до 4 фото из Pexels параллельно. Возвращает список images в формате фронта."""
+async def fetch_pexels_set(queries: list, prompts: list, randomize: bool = False) -> list:
+    """Тянет до 4 фото из Pexels параллельно. randomize=True — для перегенерации."""
     queries = (queries or [])[:4]
     photos: list = [None] * 4
     if PEXELS_API_KEY and queries:
         import asyncio
         async with httpx.AsyncClient() as client:
             results = await asyncio.gather(
-                *[fetch_pexels(client, q, pexels_page=pexels_page) for q in queries],
+                *[fetch_pexels(client, q, randomize=randomize) for q in queries],
                 return_exceptions=False,
             )
         for i, res in enumerate(results):
@@ -290,7 +308,7 @@ async def attach_pexels_images(concepts: list) -> None:
         return
     import asyncio
     tasks = [
-        fetch_pexels_set(c.get("pexels_queries") or [], c.get("image_prompts") or [], pexels_page=1)
+        fetch_pexels_set(c.get("pexels_queries") or [], c.get("image_prompts") or [], randomize=False)
         for c in concepts
     ]
     results = await asyncio.gather(*tasks, return_exceptions=False)
@@ -322,17 +340,12 @@ async def regenerate_images_endpoint(request: Request):
     body = await request.json()
     queries = body.get("pexels_queries") or []
     prompts = body.get("image_prompts") or []
-    try:
-        pexels_page = int(body.get("page") or 2)
-    except (TypeError, ValueError):
-        pexels_page = 2
-    pexels_page = max(1, min(pexels_page, 80))  # Pexels отдаёт до 80 страниц по 5 фото
 
     if not queries:
         return JSONResponse({"error": "pexels_queries is empty"}, status_code=400)
 
-    images = await fetch_pexels_set(queries, prompts, pexels_page=pexels_page)
-    return JSONResponse({"images": images, "page": pexels_page})
+    images = await fetch_pexels_set(queries, prompts, randomize=True)
+    return JSONResponse({"images": images})
 
 
 @app.post("/brief")
