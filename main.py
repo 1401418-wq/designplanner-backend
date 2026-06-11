@@ -348,6 +348,274 @@ async def regenerate_images_endpoint(request: Request):
     return JSONResponse({"images": images})
 
 
+# ─────────────────── TZ brief (signed clients) ───────────────────
+
+TZ_SECTIONS = [
+    ("general", "Общее", [
+        ("address", "Адрес"),
+        ("area_bti", "Площадь по БТИ, м²"),
+        ("ceiling", "Высота потолков, м"),
+        ("purpose", "Для чего"),
+        ("family", "Кто живёт"),
+        ("layout", "Планировка"),
+        ("balcony", "Балкон / лоджия"),
+        ("existing_furniture", "Существующая мебель"),
+    ]),
+    ("demolition", "Демонтаж и монтаж", [
+        ("demo_existing", "Демонтаж перегородок застройщика"),
+        ("new_walls_material", "Материал новых перегородок"),
+        ("soundproofing", "Шумоизоляция"),
+        ("soundproofing_rooms", "Где шумоизоляция"),
+        ("doorway_size", "Размер межкомнатных проёмов"),
+    ]),
+    ("hallway", "Прихожая и гардеробная", [
+        ("wardrobe_type", "Шкаф"),
+        ("bench", "Банкетка"),
+        ("shoes", "Обувница"),
+        ("mirror", "Зеркало"),
+        ("hallway_notes", "Доп."),
+    ]),
+    ("kitchen", "Кухня", [
+        ("kitchen_type", "Планировка"),
+        ("glass_partition", "Стеклянная перегородка"),
+        ("dining_zone", "Обеденная зона"),
+        ("dining_size", "Размер стола"),
+        ("hob", "Варочная панель"),
+        ("hob_burners", "Конфорки"),
+        ("fridge", "Холодильник"),
+        ("dishwasher", "Посудомойка"),
+        ("oven", "Духовка"),
+        ("microwave", "СВЧ"),
+        ("extra_tech", "Доп. техника"),
+        ("hood", "Вытяжка"),
+        ("hood_mode", "Режим вытяжки"),
+        ("sink", "Мойка"),
+        ("sink_size", "Размер мойки"),
+        ("disposer", "Диспоузер"),
+        ("tv_kitchen", "ТВ на кухне"),
+        ("kitchen_notes", "Доп."),
+    ]),
+    ("bath_master", "Санузел — мастер", [
+        ("wc", "Унитаз"),
+        ("wc_extras", "Биде / гигдуш"),
+        ("bath_or_shower", "Ванна или душ"),
+        ("bath_type", "Тип ванны"),
+        ("shower_type", "Душевая"),
+        ("shower_drain", "Слив"),
+        ("shower_seat", "Сидушка в душе"),
+        ("shower_mixer", "Смеситель в душе"),
+        ("shower_kit", "Душевой комплект"),
+        ("basin", "Раковина"),
+        ("basin_mixer", "Смеситель раковины"),
+        ("bath_mirror", "Зеркало"),
+        ("vanity", "Тумба"),
+        ("bath_storage", "Скрытое хранение"),
+        ("bath_master_notes", "Доп."),
+    ]),
+    ("bath_guest", "Санузел — гостевой", [
+        ("g_wc", "Унитаз"),
+        ("g_bath", "Ванна"),
+        ("g_shower", "Душевая"),
+        ("g_shower_kit", "Душевой комплект"),
+        ("g_shower_seat", "Сидушка"),
+        ("g_basin", "Раковина"),
+        ("g_basin_mixer", "Смеситель"),
+        ("g_extras", "Доп."),
+        ("bath_guest_notes", "Прочее"),
+    ]),
+    ("bedroom", "Спальня", [
+        ("bed_size", "Размер матраса"),
+        ("headboard", "Изголовье"),
+        ("bedside", "Тумбы"),
+        ("bedside_size", "Размер тумб"),
+        ("bedroom_wardrobe", "Шкаф / гардеробная"),
+        ("wardrobe_facades", "Фасады"),
+        ("dresser", "Комод"),
+        ("vanity_table", "Макияжный столик"),
+        ("bedroom_office", "Рабочее место"),
+        ("bedroom_tv", "ТВ"),
+        ("bedroom_notes", "Доп."),
+    ]),
+    ("office", "Кабинет", [
+        ("office_setup", "Оборудование"),
+        ("office_extra_tech", "Доп. техника"),
+        ("office_furniture", "Мебель"),
+        ("office_tv", "ТВ"),
+        ("office_notes", "Доп."),
+    ]),
+    ("kids", "Детская", [
+        ("kid_age", "Возраст"),
+        ("kid_bed", "Спальное место"),
+        ("kid_bed_position", "Расположение"),
+        ("kid_bedside", "Тумбы"),
+        ("kid_desk", "Стол"),
+        ("kid_storage", "Хранение книг"),
+        ("kid_sport", "Спорт"),
+        ("kid_wardrobe", "Шкаф / гардероб"),
+        ("kid_tv", "ТВ"),
+        ("kids_notes", "Доп."),
+    ]),
+    ("pets", "Животные и растения", [
+        ("pets_kind", "Животные"),
+        ("pets_zones", "Зоны для животных"),
+        ("plants", "Растения"),
+    ]),
+    ("utility", "Хозблок и хранение", [
+        ("washer", "Стиралка / сушилка"),
+        ("drying", "Раскладная сушка"),
+        ("steamer", "Доп. техника"),
+        ("ironing", "Гладильная доска"),
+        ("vacuum_niche", "Отсек для пылесоса"),
+        ("mop_storage", "Швабра и химия"),
+        ("safe", "Сейф"),
+        ("safe_size", "Размер сейфа"),
+        ("extra_storage", "Что хранить"),
+        ("hobby_items", "Увлечения"),
+    ]),
+    ("doors", "Межкомнатные двери", [
+        ("door_size", "Размер полотна"),
+        ("door_casing", "Наличники"),
+        ("door_type", "Тип"),
+        ("door_stops", "Ограничители"),
+        ("doors_notes", "Доп."),
+    ]),
+    ("floors", "Полы", [
+        ("floor_main", "Покрытие"),
+        ("floor_pattern", "Раскладка"),
+        ("floor_mount", "Крепление"),
+        ("floor_tile_zones", "Плитка где"),
+        ("floor_joint", "Стыки"),
+        ("skirting", "Плинтус"),
+        ("wardrobe_skirting", "Плинтус в шкафах"),
+        ("warm_floor", "Тёплый пол"),
+        ("warm_floor_type", "Тип ТП"),
+        ("warm_floor_zones", "Зоны ТП"),
+        ("warm_floor_control", "Управление ТП"),
+        ("floors_notes", "Доп."),
+    ]),
+    ("ceiling", "Потолок", [
+        ("ceiling_type", "Конструкция"),
+        ("ceiling_edge", "Профиль примыкания"),
+        ("curtain_cornice", "Карнизы"),
+        ("smart_curtains", "Электрокарнизы"),
+        ("ceiling_notes", "Доп."),
+    ]),
+    ("lighting", "Освещение", [
+        ("main_light", "Основное"),
+        ("led_decor", "LED-подсветка"),
+        ("motion_sensors", "Датчики движения"),
+        ("night_light", "Ночное"),
+        ("master_switch", "Мастер-выключатель"),
+        ("lighting_notes", "Доп."),
+    ]),
+    ("engineering", "Инженерия и сантехника", [
+        ("radiators", "Радиаторы"),
+        ("ac", "Кондиционирование"),
+        ("ventilation", "Вентиляция"),
+        ("water_heater", "Водонагреватель"),
+        ("towel_warmer", "Полотенцесушитель"),
+        ("leak_control", "Контроль протечек"),
+        ("leak_zones", "Где датчики"),
+        ("water_filter", "Магистр. фильтры"),
+        ("drinking_filter", "Питьевой фильтр"),
+        ("fire_alarm", "Пожарка"),
+        ("engineering_notes", "Доп."),
+    ]),
+    ("electrics", "Техника и электрика", [
+        ("switchboard", "Щит"),
+        ("led_drivers", "Блоки питания LED"),
+        ("intercom", "Домофон"),
+        ("security", "Безопасность"),
+        ("security_camera_zones", "Камеры где"),
+        ("smart_home", "Умный дом"),
+        ("wifi_router", "Wi-Fi роутер"),
+        ("ethernet", "Ethernet"),
+        ("tvs", "ТВ где"),
+        ("tv_mount", "Монтаж ТВ"),
+        ("tv_cable", "Кабель-канал"),
+        ("av_system", "Кинотеатр"),
+        ("extra_sockets", "Спец-розетки"),
+        ("electrics_notes", "Доп."),
+    ]),
+    ("finishing", "Финишная отделка", [
+        ("wall_finish", "Материал стен"),
+        ("wall_finish_zones", "Где какой"),
+        ("corner_protection", "Защита углов"),
+        ("sills", "Подоконники"),
+        ("window_slopes", "Откосы окон"),
+        ("entry_door_slopes", "Откосы входной двери"),
+        ("finishing_notes", "Доп."),
+    ]),
+    ("aesthetics", "Эстетика и стиль", [
+        ("style_consistency", "Единый или разный стиль"),
+        ("style_desc", "Стиль"),
+        ("anchor_object", "Любимая вещь"),
+        ("color_pref", "Цветовые предпочтения"),
+        ("color_no", "Неприятные цвета"),
+        ("taboo", "Табу"),
+    ]),
+]
+
+
+def _format_value(v) -> str:
+    if isinstance(v, list):
+        return ", ".join(str(x) for x in v if x) if v else ""
+    return str(v or "").strip()
+
+
+def _format_tz_text(client: dict, answers: dict) -> str:
+    lines = []
+    name = (client.get("name") or "").strip() or "—"
+    contact = (client.get("contact") or "").strip() or "—"
+    project = (client.get("project") or "").strip()
+    lines.append(f"Клиент: {name}")
+    lines.append(f"Контакт: {contact}")
+    if project:
+        lines.append(f"Проект: {project}")
+
+    for sec_id, sec_title, fields in TZ_SECTIONS:
+        sec_data = answers.get(sec_id) or {}
+        rows = []
+        for fid, flabel in fields:
+            val = _format_value(sec_data.get(fid))
+            if val:
+                rows.append(f"  · {flabel}: {val}")
+        if rows:
+            lines.append("")
+            lines.append(f"━ {sec_title}")
+            lines.extend(rows)
+    return "\n".join(lines)
+
+
+@app.post("/tz")
+async def tz_endpoint(request: Request):
+    body = await request.json()
+    client = body.get("client") or {}
+    answers = body.get("answers") or {}
+    view_url = (body.get("view_url") or "").strip()
+
+    if not (client.get("name") or "").strip():
+        return JSONResponse({"error": "Имя обязательно"}, status_code=400)
+    if not (client.get("contact") or "").strip():
+        return JSONResponse({"error": "Контакт обязателен"}, status_code=400)
+
+    brief_text = _format_tz_text(client, answers)
+    summary = f"📐 Новый бриф ТЗ\n\n{brief_text}"
+    if view_url:
+        summary += f"\n\nПолная версия для печати:\n{view_url}"
+
+    await broadcast_lead({
+        "source": "design-planner.com/tz",
+        "name": (client.get("name") or "").strip() or "—",
+        "contact": (client.get("contact") or "").strip() or "—",
+        "niche": "дизайн интерьера",
+        "tariff": "—",
+        "summary": summary,
+    })
+
+    return JSONResponse({"ok": True})
+
+
 @app.post("/brief")
 async def brief_endpoint(request: Request):
     if not ANTHROPIC_API_KEY:
