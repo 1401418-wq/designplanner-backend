@@ -20,6 +20,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BROADCAST_URL = os.environ.get("BROADCAST_URL", "")
 BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+TZ_ACCESS_KEY = os.environ.get("TZ_ACCESS_KEY", "")
 
 SYSTEM = """Ты — Алина, умный помощник студии дизайна интерьера Design Planner (дизайнер Екатерина, Москва).
 Отвечай вежливо, по делу, в спокойном профессиональном тоне. Без лишних эмодзи.
@@ -593,6 +594,10 @@ async def tz_endpoint(request: Request):
     client = body.get("client") or {}
     answers = body.get("answers") or {}
     view_url = (body.get("view_url") or "").strip()
+    submitted_key = (body.get("access_key") or "").strip()
+
+    if TZ_ACCESS_KEY and submitted_key != TZ_ACCESS_KEY:
+        return JSONResponse({"error": "Доступ только по персональной ссылке"}, status_code=403)
 
     if not (client.get("name") or "").strip():
         return JSONResponse({"error": "Имя обязательно"}, status_code=400)
