@@ -325,7 +325,7 @@ async def chat(request: Request):
     return JSONResponse({"reply": reply, "usage": data.get("usage"), "sig": _sign(reply)})
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "ok", "service": "Design Planner AI Agent — Alina"}
 
