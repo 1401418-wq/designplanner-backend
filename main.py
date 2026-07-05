@@ -82,6 +82,68 @@ def _validate_chat_messages(messages) -> str | None:
     return None
 
 
+# ─────────────────── Обезличивание ПД перед отправкой за рубеж (152-ФЗ) ───────────────────
+# За границу (Anthropic) уходит только текст с плейсхолдерами вместо ПД.
+# Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_TG_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,}")
+_PHONE_RE = re.compile(r"\+?[78]?[\s\-()]*\d(?:[\s\-()]*\d){9,10}")
+_NAME_RE = re.compile(r"(меня зовут|мо[её] имя|зовут меня)\s+([А-ЯЁ][а-яё]+)", re.I)
+
+
+def _mask_pii(text: str, mapping: dict) -> str:
+    if not isinstance(text, str):
+        return text
+
+    def _ph(kind: str, val: str) -> str:
+        for ph, v in mapping.items():
+            if v == val:
+                return ph
+        ph = f"[{kind}_{len(mapping) + 1}]"
+        mapping[ph] = val
+        return ph
+
+    text = _EMAIL_RE.sub(lambda m: _ph("EMAIL", m.group(0)), text)
+    text = _TG_RE.sub(lambda m: _ph("TG", m.group(0)), text)
+    text = _PHONE_RE.sub(lambda m: _ph("PHONE", m.group(0)), text)
+    text = _NAME_RE.sub(lambda m: m.group(1) + " " + _ph("NAME", m.group(2)), text)
+    return text
+
+
+def _unmask(text: str, mapping: dict) -> str:
+    for ph, val in mapping.items():
+        text = text.replace(ph, val)
+    return text
+
+
+def _mask_messages(messages: list) -> tuple[list, dict]:
+    """(обезличенные messages, mapping) — для зарубежного LLM."""
+    mapping: dict = {}
+    masked = [
+        {"role": m["role"], "content": _mask_pii(str(m.get("content", "")), mapping)}
+        for m in messages
+    ]
+    return masked, mapping
+
+
+def _extract_contact_local(text: str) -> dict:
+    """Извлекает контакт из текста ЛОКАЛЬНО (без LLM) — чтобы ПД не уходили за рубеж."""
+    phone = _PHONE_RE.search(text)
+    tg = _TG_RE.search(text)
+    email = _EMAIL_RE.search(text)
+    name_m = _NAME_RE.search(text)
+    if phone:
+        contact = phone.group(0).strip()
+    elif tg:
+        contact = tg.group(0).strip()
+    elif email:
+        contact = email.group(0).strip()
+    else:
+        contact = None
+    name = name_m.group(2) if name_m else None
+    return {"name": name, "contact": contact, "has_lead": bool(contact)}
+
+
 def _sign(content: str) -> str:
     """Подпись реплики ассистента — чтобы клиент не мог подделать историю (нет БД)."""
     key = (BROADCAST_SECRET or "unset").encode()
@@ -217,6 +279,9 @@ async def chat(request: Request):
     if not trusted:
         return JSONResponse({"error": "messages is empty"}, status_code=400)
 
+    # Обезличиваем перед отправкой за рубеж (Anthropic, США): ПД → плейсхолдеры
+    masked_messages, pii_map = _mask_messages(trusted)
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -236,7 +301,7 @@ async def chat(request: Request):
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    "messages": trusted,
+                    "messages": masked_messages,
                 },
             )
             data = response.json()
@@ -253,6 +318,10 @@ async def chat(request: Request):
     if not reply:
         print(f"[chat] empty reply, raw={data}")
         return JSONResponse({"error": "empty reply from model"}, status_code=502)
+
+    # Возвращаем настоящие значения в ответ пользователю (Claude их не видел),
+    # подпись считаем от НАСТОЯЩЕГО текста, чтобы клиент не мог подделать историю
+    reply = _unmask(reply, pii_map)
     return JSONResponse({"reply": reply, "usage": data.get("usage"), "sig": _sign(reply)})
 
 
@@ -773,6 +842,11 @@ async def brief_endpoint(request: Request):
 
     brief_text = _format_brief_for_claude(body)
 
+    # Обезличиваем перед отправкой за рубеж (Anthropic, США): ПД клиента в тексте брифа → плейсхолдеры.
+    # Ответ Claude — это концепции (JSON), ПД там не бывает, поэтому un-mask не нужен.
+    emap: dict = {}
+    masked_brief = _mask_pii(brief_text, emap)
+
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             response = await client.post(
@@ -795,7 +869,7 @@ async def brief_endpoint(request: Request):
                     "messages": [
                         {
                             "role": "user",
-                            "content": f"Бриф клиента:\n\n{brief_text}\n\nДай 3 концепт-направления.",
+                            "content": f"Бриф клиента:\n\n{masked_brief}\n\nДай 3 концепт-направления.",
                         }
                     ],
                 },
