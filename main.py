@@ -8,6 +8,8 @@ import random
 import re
 import time as _time
 import secrets
+import hmac
+import hashlib
 
 app = FastAPI()
 
@@ -78,6 +80,34 @@ def _validate_chat_messages(messages) -> str | None:
     if total > MAX_TOTAL_CHARS:
         return "conversation too long"
     return None
+
+
+def _sign(content: str) -> str:
+    """Подпись реплики ассистента — чтобы клиент не мог подделать историю (нет БД)."""
+    key = (BROADCAST_SECRET or "unset").encode()
+    return hmac.new(key, content.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def _trusted_history(messages: list) -> list:
+    """user-турны берём как есть; assistant-турны — только с валидной подписью.
+    Поддельные/неподписанные assistant-реплики отбрасываем, затем нормализуем чередование."""
+    kept = []
+    for m in messages:
+        role = m.get("role")
+        content = str(m.get("content", ""))
+        if role == "user":
+            kept.append({"role": "user", "content": content})
+        elif role == "assistant" and hmac.compare_digest(str(m.get("sig", "")), _sign(content)):
+            kept.append({"role": "assistant", "content": content})
+    norm: list = []
+    for m in kept:
+        if not norm and m["role"] != "user":
+            continue
+        if norm and norm[-1]["role"] == m["role"]:
+            norm[-1]["content"] += "\n\n" + m["content"]
+        else:
+            norm.append(dict(m))
+    return norm
 
 SYSTEM = """Ты — Алина, умный помощник студии дизайна интерьера Design Planner (дизайнер Екатерина, Москва).
 Отвечай вежливо, по делу, в спокойном профессиональном тоне. Без лишних эмодзи.
@@ -182,6 +212,11 @@ async def chat(request: Request):
     if _rate_limited("chat:_global", limit=300, window=60):
         return JSONResponse({"error": "Сервис перегружен, попробуйте через минуту."}, status_code=429)
 
+    # Доверяем только подписанным assistant-репликам — иначе историю можно подделать
+    trusted = _trusted_history(messages)
+    if not trusted:
+        return JSONResponse({"error": "messages is empty"}, status_code=400)
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -201,7 +236,7 @@ async def chat(request: Request):
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    "messages": messages,
+                    "messages": trusted,
                 },
             )
             data = response.json()
@@ -218,7 +253,7 @@ async def chat(request: Request):
     if not reply:
         print(f"[chat] empty reply, raw={data}")
         return JSONResponse({"error": "empty reply from model"}, status_code=502)
-    return JSONResponse({"reply": reply, "usage": data.get("usage")})
+    return JSONResponse({"reply": reply, "usage": data.get("usage"), "sig": _sign(reply)})
 
 
 @app.get("/")
@@ -689,9 +724,8 @@ async def tz_endpoint(request: Request):
         view_url = ""
     submitted_key = (body.get("access_key") or "").strip()
 
-    # NB: fail-open если ключ не задан — историческое поведение. Закрыть отдельно,
-    # предварительно выставив TZ_ACCESS_KEY в Railway (иначе сломается форма клиента).
-    if TZ_ACCESS_KEY and not secrets.compare_digest(submitted_key, TZ_ACCESS_KEY):
+    # fail-closed: без выставленного TZ_ACCESS_KEY эндпоинт закрыт (ключ в Railway есть, проверено)
+    if not TZ_ACCESS_KEY or not secrets.compare_digest(submitted_key, TZ_ACCESS_KEY):
         return JSONResponse({"error": "Доступ только по персональной ссылке"}, status_code=403)
 
     if not (client.get("name") or "").strip():
