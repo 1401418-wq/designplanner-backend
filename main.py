@@ -6,12 +6,22 @@ import json
 import os
 import random
 import re
+import time as _time
+import secrets
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "https://design-planner.com",
+    "https://www.design-planner.com",
+    "https://pervyyii.ru",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -21,6 +31,53 @@ BROADCAST_URL = os.environ.get("BROADCAST_URL", "")
 BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 TZ_ACCESS_KEY = os.environ.get("TZ_ACCESS_KEY", "")
+
+# ─────────────────── Лимиты и защита от абуза ───────────────────
+_rate_buckets: dict[str, list[float]] = {}
+MAX_MESSAGES = 40
+MAX_MSG_CHARS = 8000
+MAX_TOTAL_CHARS = 24000
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
+    now = _time.time()
+    bucket = [t for t in _rate_buckets.get(key, []) if now - t < window]
+    if len(bucket) >= limit:
+        _rate_buckets[key] = bucket
+        return True
+    bucket.append(now)
+    _rate_buckets[key] = bucket
+    if len(_rate_buckets) > 10000:
+        for k in [k for k, v in _rate_buckets.items() if not [t for t in v if now - t < window]]:
+            _rate_buckets.pop(k, None)
+    return False
+
+
+def _validate_chat_messages(messages) -> str | None:
+    if not isinstance(messages, list) or not messages:
+        return "messages is empty"
+    if len(messages) > MAX_MESSAGES:
+        return "too many messages"
+    total = 0
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            return "invalid message role"
+        content = m.get("content")
+        if not isinstance(content, str):
+            return "message content must be a string"
+        if len(content) > MAX_MSG_CHARS:
+            return "message too long"
+        total += len(content)
+    if total > MAX_TOTAL_CHARS:
+        return "conversation too long"
+    return None
 
 SYSTEM = """Ты — Алина, умный помощник студии дизайна интерьера Design Planner (дизайнер Екатерина, Москва).
 Отвечай вежливо, по делу, в спокойном профессиональном тоне. Без лишних эмодзи.
@@ -110,10 +167,20 @@ async def chat(request: Request):
             status_code=500,
         )
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     messages = body.get("messages", [])
-    if not messages:
-        return JSONResponse({"error": "messages is empty"}, status_code=400)
+    err = _validate_chat_messages(messages)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(f"chat:{ip}", limit=60, window=3600):
+        return JSONResponse({"error": "Слишком много запросов. Попробуйте позже."}, status_code=429)
+    if _rate_limited("chat:_global", limit=300, window=60):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте через минуту."}, status_code=429)
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -142,16 +209,15 @@ async def chat(request: Request):
         return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
 
     if "error" in data:
-        return JSONResponse({"error": data["error"]}, status_code=response.status_code or 500)
+        print(f"[chat] upstream error: {data['error']}")
+        return JSONResponse({"error": "upstream error"}, status_code=response.status_code or 500)
 
     content = data.get("content") or []
     text_parts = [block.get("text", "") for block in content if block.get("type") == "text"]
     reply = "".join(text_parts).strip()
     if not reply:
-        return JSONResponse(
-            {"error": "empty reply from model", "raw": data},
-            status_code=502,
-        )
+        print(f"[chat] empty reply, raw={data}")
+        return JSONResponse({"error": "empty reply from model"}, status_code=502)
     return JSONResponse({"reply": reply, "usage": data.get("usage")})
 
 
@@ -351,7 +417,16 @@ async def regenerate_images_endpoint(request: Request):
     if not PEXELS_API_KEY:
         return JSONResponse({"error": "PEXELS_API_KEY is not configured"}, status_code=500)
 
-    body = await request.json()
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(f"regen:{ip}", limit=30, window=3600):
+        return JSONResponse({"error": "Слишком много запросов. Попробуйте позже."}, status_code=429)
+    if _rate_limited("regen:_global", limit=120, window=3600):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     queries = body.get("pexels_queries") or []
     prompts = body.get("image_prompts") or []
 
@@ -603,13 +678,20 @@ def _format_tz_text(client: dict, answers: dict) -> str:
 
 @app.post("/tz")
 async def tz_endpoint(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     client = body.get("client") or {}
     answers = body.get("answers") or {}
     view_url = (body.get("view_url") or "").strip()
+    if view_url and not view_url.startswith("https://design-planner.com/"):
+        view_url = ""
     submitted_key = (body.get("access_key") or "").strip()
 
-    if TZ_ACCESS_KEY and submitted_key != TZ_ACCESS_KEY:
+    # NB: fail-open если ключ не задан — историческое поведение. Закрыть отдельно,
+    # предварительно выставив TZ_ACCESS_KEY в Railway (иначе сломается форма клиента).
+    if TZ_ACCESS_KEY and not secrets.compare_digest(submitted_key, TZ_ACCESS_KEY):
         return JSONResponse({"error": "Доступ только по персональной ссылке"}, status_code=403)
 
     if not (client.get("name") or "").strip():
@@ -639,7 +721,16 @@ async def brief_endpoint(request: Request):
     if not ANTHROPIC_API_KEY:
         return JSONResponse({"error": "ANTHROPIC_API_KEY is not configured"}, status_code=500)
 
-    body = await request.json()
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(f"brief:{ip}", limit=10, window=3600):
+        return JSONResponse({"error": "Слишком много запросов. Попробуйте через час."}, status_code=429)
+    if _rate_limited("brief:_global", limit=60, window=3600):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     if not body.get("room") and not body.get("area"):
         return JSONResponse(
             {"error": "Минимум укажите помещение или площадь"},
@@ -680,16 +771,19 @@ async def brief_endpoint(request: Request):
         return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
 
     if "error" in data:
-        return JSONResponse({"error": data["error"]}, status_code=response.status_code or 500)
+        print(f"[brief] upstream error: {data['error']}")
+        return JSONResponse({"error": "upstream error"}, status_code=response.status_code or 500)
 
     text = "".join(b.get("text", "") for b in (data.get("content") or []) if b.get("type") == "text").strip()
     if not text:
-        return JSONResponse({"error": "empty reply from model", "raw": data}, status_code=502)
+        print(f"[brief] empty reply, raw={data}")
+        return JSONResponse({"error": "empty reply from model"}, status_code=502)
 
     try:
         concepts = _parse_concepts(text)
     except Exception as e:
-        return JSONResponse({"error": f"could not parse concepts: {e}", "raw": text[:500]}, status_code=502)
+        print(f"[brief] parse failed: {e}; raw={text[:500]}")
+        return JSONResponse({"error": "could not parse concepts"}, status_code=502)
 
     # подтянуть реальные фото из Pexels (если ключ выставлен)
     await attach_pexels_images(concepts)
