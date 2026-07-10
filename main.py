@@ -42,6 +42,9 @@ MAX_TOTAL_CHARS = 24000
 
 
 def _client_ip(request: Request) -> str:
+    xr = request.headers.get("x-real-ip", "").strip()
+    if xr:
+        return xr
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
@@ -87,7 +90,7 @@ def _validate_chat_messages(messages) -> str | None:
 # Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _TG_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,}")
-_PHONE_RE = re.compile(r"\+?[78]?[\s\-()]*\d(?:[\s\-()]*\d){9,10}")
+_PHONE_RE = re.compile(r"\+?[78]?[\s\-().]*\d(?:[\s\-().]*\d){9,10}")
 _NAME_RE = re.compile(r"(меня зовут|мо[её] имя|зовут меня)\s+([А-ЯЁ][а-яё]+)", re.I)
 
 
@@ -306,7 +309,8 @@ async def chat(request: Request):
             )
             data = response.json()
     except httpx.HTTPError as e:
-        return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
+        print(f"[chat] upstream failed: {e}")
+        return JSONResponse({"error": "upstream request failed"}, status_code=502)
 
     if "error" in data:
         print(f"[chat] upstream error: {data['error']}")
@@ -876,7 +880,8 @@ async def brief_endpoint(request: Request):
             )
             data = response.json()
     except httpx.HTTPError as e:
-        return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
+        print(f"[chat] upstream failed: {e}")
+        return JSONResponse({"error": "upstream request failed"}, status_code=502)
 
     if "error" in data:
         print(f"[brief] upstream error: {data['error']}")
